@@ -31,31 +31,34 @@ WORKDIR /app
 # ==================================================
 RUN apk add --no-cache \
     git bash python3 make gcc g++ libc-dev build-base \
-    openssl ncurses-libs erlang erlang-crypto erlang-sasl erlang-inets \
-    erlang-runtime-tools erlang-public-key erlang-ssl zlib curl ca-certificates
+    openssl ncurses-libs erlang erlang-ssl erlang-public-key \
+    erlang-crypto erlang-asn1 erlang-xmerl zlib curl ca-certificates
 
-# Install Node 18 musl binary manually
+# Install Node 18 MUSL binary manually
 RUN curl -fsSL https://unofficial-builds.nodejs.org/download/release/v18.17.1/node-v18.17.1-linux-x64-musl.tar.xz \
   | tar -xJ -C /usr/local --strip-components=1
 
+# Install npm 8 (CRA compatible)
 RUN npm install -g npm@8
 
-# --------------------------
-# Frontend Step
-# --------------------------
+
+#############################
+# Frontend build
+#############################
 COPY assets/package.json assets/package-lock.json ./assets/
 RUN npm ci --prefix=assets --legacy-peer-deps
 
-# Fix Webpack 4 + OpenSSL 3 (Node 17+)
+# Fix Node 17+ + Webpack 4 + OpenSSL 3 issue
 ENV NODE_OPTIONS=--openssl-legacy-provider
 
 COPY priv priv
 COPY assets assets
 RUN npm run build --prefix=assets
 
-# --------------------------
-# Backend Step
-# --------------------------
+
+#############################
+# Backend build
+#############################
 COPY mix.exs mix.lock ./
 COPY config config/
 
@@ -72,32 +75,33 @@ COPY rel rel
 RUN mix release papercups
 
 
-#############################
-# 2. RUNTIME CONTAINER
-#############################
-FROM alpine:3.13 AS app
 
+#############################
+# 2. RUNTIME IMAGE
+#############################
+FROM alpine:3.17 AS app
+
+# OTP libs for running Elixir release on Alpine
 RUN apk add --no-cache \
   openssl ncurses-libs zlib bash \
-  erlang erlang-crypto erlang-sasl erlang-inets \
-  erlang-runtime-tools erlang-public-key erlang-ssl
+  erlang erlang-crypto erlang-asn1 erlang-xmerl \
+  erlang-public-key erlang-ssl erlang-sasl erlang-inets \
+  erlang-runtime-tools
 
 ENV LANG=C.UTF-8
 
 WORKDIR /app
 ENV HOME=/app
 
-# Create unprivileged user
 RUN adduser -h /app -u 1000 -s /bin/sh -D papercupsuser
 
 # Copy release
 COPY --from=builder --chown=papercupsuser:papercupsuser /app/_build/prod/rel/papercups /app
 COPY --from=builder --chown=papercupsuser:papercupsuser /app/priv /app/priv
 
-# IMPORTANT: Give execute permission to BEAM release
-RUN chmod -R 755 /app/releases || true
+# Ensure BEAM release can run
+RUN chmod -R 755 /app/releases
 
-# Entrypoint
 COPY docker-entrypoint.sh /entrypoint.sh
 RUN chmod a+x /entrypoint.sh
 
