@@ -1,57 +1,95 @@
-# --------------------------------------------------------
-# BUILDER
-# --------------------------------------------------------
-FROM elixir:1.11.3-alpine AS builder
+FROM elixir:1.11.3-alpine as builder
 
-ENV MIX_ENV=prod
+# build step
+ARG MIX_ENV=prod
+ARG NODE_ENV=production
+ARG APP_VER=0.0.1
+ARG USE_IP_V6=false
+ARG REQUIRE_DB_SSL=false
+ARG AWS_ACCESS_KEY_ID
+ARG AWS_SECRET_ACCESS_KEY
+ARG BUCKET_NAME
+ARG AWS_REGION
+ARG PAPERCUPS_STRIPE_SECRET
 
-# Install build dependencies
-RUN apk update && apk add --no-cache \
-  git curl wget build-base \
-  nodejs npm yarn python3 \
-  ca-certificates openssl ncurses-libs erlang
+ENV APP_VERSION=$APP_VER
+ENV REQUIRE_DB_SSL=$REQUIRE_DB_SSL
+ENV USE_IP_V6=$USE_IP_V6
+ENV AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+ENV AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+ENV BUCKET_NAME=$BUCKET_NAME
+ENV AWS_REGION=$AWS_REGION
+ENV PAPERCUPS_STRIPE_SECRET=$PAPERCUPS_STRIPE_SECRET
 
-# --- FIX Node version ---
-# Remove old npm that breaks build
-RUN npm install -g npm@8 && npm cache clean --force
-
+RUN mkdir /app
 WORKDIR /app
 
-# Install hex & rebar
-RUN mix local.hex --force && \
-    mix local.rebar --force
+# ---------------------------------------------
+# FIX 1: dùng node 18 thay vì node 14
+# ---------------------------------------------
+RUN apk add --no-cache curl bash git python3 build-base gcc libc-dev make \
+    erlang openssl ncurses-libs ca-certificates \
+    && curl -fsSL https://unofficial-builds.nodejs.org/download/release/v18.17.1/node-v18.17.1-linux-x64-musl.tar.xz \
+    | tar -xJ -C /usr/local --strip-components=1 \
+    && ln -sf /usr/local/bin/node /usr/bin/node \
+    && ln -sf /usr/local/bin/npm /usr/bin/npm \
+    && ln -sf /usr/local/bin/npx /usr/bin/npx \
+    && npm install -g npm@8
 
-# Install Elixir deps
+# ---------------------------------------------
+# Client side build
+# ---------------------------------------------
+COPY assets/package.json assets/package-lock.json ./assets/
+RUN npm ci --prefix=assets --legacy-peer-deps
+
+ENV GENERATE_SOURCEMAP=false
+
+COPY priv priv
+COPY assets assets
+RUN npm run build --prefix=assets
+
 COPY mix.exs mix.lock ./
 COPY config config
-RUN mix deps.get --only prod && mix deps.compile
 
-# Install JS deps
-COPY assets/package.json assets/package-lock.json ./assets/
-RUN npm install --prefix=assets --legacy-peer-deps
+RUN mix local.hex --force && \
+    mix local.rebar --force && \
+    mix deps.get --only prod
 
-# Build assets
-COPY assets assets
-RUN npm run --prefix=assets deploy
-RUN mix phx.digest
-
-# Build release
 COPY lib lib
-COPY priv priv
-RUN mix release
+RUN mix deps.compile
+RUN mix phx.digest priv/static
 
-# --------------------------------------------------------
-# APP
-# --------------------------------------------------------
+COPY rel rel
+RUN mix release papercups
+
+# ==================================================
+# Runtime image
+# ==================================================
 FROM alpine:3.13 AS app
 
 RUN apk add --no-cache openssl ncurses-libs
+ENV LANG=C.UTF-8
+EXPOSE 4000
 
 WORKDIR /app
-RUN adduser -S papercupsuser
 
-COPY --from=builder /app/_build/prod/rel/papercups ./
+ENV HOME=/app
+
+RUN adduser -h /app -u 1000 -s /bin/sh -D papercupsuser
+
+COPY --from=builder /app/_build/prod/rel/papercups /app
+COPY --from=builder /app/priv /app/priv
+
+# ---------------------------------------------
+# FIX 2: quyền execute cho release
+# ---------------------------------------------
+RUN chmod -R 755 /app
+
+COPY docker-entrypoint.sh /entrypoint.sh
+RUN chmod a+x /entrypoint.sh
 
 USER papercupsuser
 
-CMD ["bin/papercups", "start"]
+WORKDIR /app
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["run"]
